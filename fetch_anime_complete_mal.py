@@ -40,16 +40,19 @@ only required for endpoints that modify a user's list.
 Output: anime_all_complete.json
 """
 
-import json, time, os, sys, requests
+import json, time, os, sys, requests, random
 from collections import defaultdict
 
 MAL_API          = "https://api.myanimelist.net/v2"
 ANILIST_API      = "https://graphql.anilist.co"
 CLIENT_ID        = os.environ.get("MAL_CLIENT_ID", "")
-MAL_INTERVAL     = 1.0     # be polite - MAL doesn't publish an official number
+MAL_INTERVAL     = 1.35     # be polite - MAL doesn't publish an official number
 ANILIST_INTERVAL = 0.72
 OUTPUT_FILE      = "anime_all_complete.json"
 CHECKPOINT_FILE  = "checkpoint_anime.json"
+MAL_CACHE_FILE   = "mal_season_cache.json"
+ANILIST_CACHE_FILE = "anilist_lookup_cache.json"
+MAL_DETAIL_CACHE_FILE = "mal_detail_cache.json"
 ANILIST_BATCH    = 50
 PAGE_LIMIT       = 100     # MAL max limit per page for the anime list endpoint
 
@@ -69,36 +72,88 @@ DETAIL_FIELDS = (
 _last_mal = _last_anilist = 0.0
 
 
+def load_json_cache(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        print(f"[Warning] Could not load cache {path}: {exc}")
+        return default
+
+
+def save_json_cache(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 def mal_get(path, params=None):
+    """Resilient MAL GET. Returns (status, data): ok/not_found/failed."""
     global _last_mal
     if not CLIENT_ID:
-        print("[Fatal] MAL_CLIENT_ID is not set. Export MAL_CLIENT_ID or edit CLIENT_ID in the script.")
+        print("[Fatal] MAL_CLIENT_ID is not set.")
         sys.exit(1)
-    elapsed = time.monotonic() - _last_mal
-    if elapsed < MAL_INTERVAL:
-        time.sleep(MAL_INTERVAL - elapsed)
+
     url = f"{MAL_API}{path}"
-    headers = {"X-MAL-CLIENT-ID": CLIENT_ID}
-    for attempt in range(8):
+    headers = {
+        "X-MAL-CLIENT-ID": CLIENT_ID,
+        "Accept": "application/json",
+        "User-Agent": "clix-anime-mappings/3.0",
+        "Connection": "close",
+    }
+
+    for attempt in range(10):
+        elapsed = time.monotonic() - _last_mal
+        if elapsed < MAL_INTERVAL:
+            time.sleep(MAL_INTERVAL - elapsed)
+
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=30)
+            r = requests.get(url, params=params, headers=headers, timeout=(10, 45))
             _last_mal = time.monotonic()
+
             if r.status_code == 429:
-                time.sleep(int(r.headers.get("Retry-After", 10)))
+                retry = int(r.headers.get("Retry-After") or 30)
+                wait = max(retry, min(120, 10 * (attempt + 1))) + random.uniform(0.5, 2.5)
+                print(f"\n[MAL 429] {path} - waiting {wait:.0f}s (attempt {attempt+1}/10)", flush=True)
+                time.sleep(wait)
                 continue
+
             if r.status_code == 404:
-                return None
+                return "not_found", None
+
             if r.status_code in (401, 403):
                 print(f"\n[Fatal] MAL API auth error ({r.status_code}): {r.text[:200]}")
                 sys.exit(1)
+
             if r.status_code >= 500:
-                time.sleep(10 * (attempt + 1)); continue
+                wait = min(120, 8 * (2 ** min(attempt, 4))) + random.uniform(0, 3)
+                print(f"\n[MAL {r.status_code}] {path} - retrying in {wait:.0f}s", flush=True)
+                time.sleep(wait)
+                continue
+
             r.raise_for_status()
-            return r.json()
+            return "ok", r.json()
+
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            wait = min(120, 6 * (2 ** min(attempt, 4))) + random.uniform(0, 4)
+            print(
+                f"\n[MAL transient] {path} attempt {attempt+1}/10: "
+                f"{type(exc).__name__}; retrying in {wait:.0f}s",
+                flush=True,
+            )
+            time.sleep(wait)
         except requests.exceptions.RequestException as exc:
-            print(f"[mal_get error, attempt {attempt+1}] {exc}")
-            time.sleep(8 * (attempt + 1))
-    return None
+            wait = min(90, 8 * (attempt + 1)) + random.uniform(0, 3)
+            print(f"\n[MAL request error] {path} attempt {attempt+1}/10: {exc}; waiting {wait:.0f}s", flush=True)
+            time.sleep(wait)
+
+    print(f"\n[MAL pending] {path} failed after 10 attempts; will retry on next run.", flush=True)
+    return "failed", None
 
 
 ANILIST_QUERY = """
@@ -309,26 +364,58 @@ def save_output(entries):
 
 
 def fetch_season_all_pages(year, season):
-    """Fetch every anime node for a given (year, season), following pagination.
-    Returns [] for a season with no anime (valid), or None on a hard failure."""
+    """
+    Fetch a season with persistent per-season caching.
+
+    Return values:
+      ("ok", nodes)          successfully fetched/cached season
+      ("unavailable", [])    future/unpublished MAL season (HTTP 404)
+      ("failed", [])         hard failure after retries
+
+    Future 404 seasons are deliberately NOT cached as completed so a later
+    scheduled run can discover them when MAL publishes the endpoint.
+    """
+    cache = load_json_cache(MAL_CACHE_FILE, {"version": 1, "seasons": {}})
+    seasons = cache.setdefault("seasons", {})
+    key = f"{year}-{season}"
+
+    cached = seasons.get(key)
+    if isinstance(cached, dict) and cached.get("status") == "complete":
+        return "ok", cached.get("nodes", [])
+
     nodes = []
     offset = 0
+
     while True:
-        data = mal_get(f"/anime/season/{year}/{season}", params={
+        req_status, data = mal_get(f"/anime/season/{year}/{season}", params={
             "limit": PAGE_LIMIT,
             "offset": offset,
             "fields": LIST_FIELDS,
             "sort": "anime_score",
         })
-        if data is None:
-            return None  # signals a hard failure to the caller
+
+        if req_status == "not_found":
+            return "unavailable", []
+        if req_status == "failed":
+            return "failed", []
+
         page_nodes = [d["node"] for d in data.get("data", []) if d.get("node")]
         nodes.extend(page_nodes)
+
         has_next = bool((data.get("paging") or {}).get("next"))
         if not has_next or not page_nodes:
             break
+
         offset += PAGE_LIMIT
-    return nodes
+
+    # Persist immediately after this season completes.
+    seasons[key] = {
+        "status": "complete",
+        "nodes": nodes,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    save_json_cache(MAL_CACHE_FILE, cache)
+    return "ok", nodes
 
 
 def main():
@@ -343,7 +430,24 @@ def main():
 
     all_seasons = list(season_sequence())
     season_index, all_entries = load_checkpoint()
+
+    # Resume intelligently: completed seasons live in MAL_CACHE_FILE.
+    # If the old linear checkpoint advanced past a future 404 season, rewind
+    # only to the earliest season not present in the persistent completed cache.
+    _season_cache = load_json_cache(MAL_CACHE_FILE, {"version": 1, "seasons": {}})
+    _completed = (_season_cache.get("seasons") or {})
+    earliest_missing_index = None
+    for idx, (yy, ss) in enumerate(all_seasons):
+        item = _completed.get(f"{yy}-{ss}")
+        if not (isinstance(item, dict) and item.get("status") == "complete"):
+            earliest_missing_index = idx
+            break
+    if earliest_missing_index is not None:
+        season_index = min(season_index, earliest_missing_index)
     existing_mal_ids = {e["mal_id"] for e in all_entries}
+    detail_cache = load_json_cache(MAL_DETAIL_CACHE_FILE, {"version": 1, "details": {}, "pending": []})
+    detail_map = detail_cache.setdefault("details", {})
+    pending_detail_ids = set(detail_cache.get("pending") or [])
 
     MAX_SEASON_RETRIES = 5
     season_retry_count = 0
@@ -353,18 +457,28 @@ def main():
             year, season = all_seasons[season_index]
             print(f"  [MAL] {year} {season} ...", end=" ", flush=True)
 
-            anime_list = fetch_season_all_pages(year, season)
-            if anime_list is None:
+            season_status, anime_list = fetch_season_all_pages(year, season)
+
+            if season_status == "unavailable":
+                # Future/unpublished season. Do not mark it completed in the
+                # persistent season cache. Continue this run, and future runs
+                # will retry it automatically.
+                print("not available yet - skipping for this run")
+                season_retry_count = 0
+                season_index += 1
+                save_checkpoint(season_index, all_entries)
+                continue
+
+            if season_status == "failed":
                 season_retry_count += 1
                 if season_retry_count >= MAX_SEASON_RETRIES:
-                    print(f"failed {MAX_SEASON_RETRIES}x - skipping {year} {season} for now")
-                    season_retry_count = 0
-                    season_index += 1
+                    print(f"failed {MAX_SEASON_RETRIES}x - stopping safely")
                     save_checkpoint(season_index, all_entries)
-                    continue
+                    return
                 print(f"failed ({season_retry_count}/{MAX_SEASON_RETRIES}) - retrying in 10s ...")
                 time.sleep(10)
-                continue  # retry same season_index
+                continue
+
             season_retry_count = 0
 
             if not anime_list:
@@ -374,14 +488,51 @@ def main():
                              if a.get("id") not in existing_mal_ids]
                 print(f"{len(anime_list)} found, {len(new_anime)} new  ", end="", flush=True)
 
-                # Fetch full detail (includes related_anime) for each new entry
+                # Fetch full detail with persistent per-MAL cache. A transient
+                # network failure is kept pending instead of being permanently
+                # written as a partial record.
                 full_anime = []
-                for a in new_anime:
+                unresolved_this_season = []
+                for n, a in enumerate(new_anime, 1):
                     mid = a.get("id")
                     if not mid:
                         continue
-                    detail = mal_get(f"/anime/{mid}", params={"fields": DETAIL_FIELDS})
-                    full_anime.append(detail if detail else a)  # fallback: partial data
+
+                    cached_detail = detail_map.get(str(mid))
+                    if isinstance(cached_detail, dict) and cached_detail.get("id") == mid:
+                        full_anime.append(cached_detail)
+                        pending_detail_ids.discard(mid)
+                        continue
+
+                    detail_status, detail = mal_get(f"/anime/{mid}", params={"fields": DETAIL_FIELDS})
+                    if detail_status == "ok" and isinstance(detail, dict):
+                        detail_map[str(mid)] = detail
+                        full_anime.append(detail)
+                        pending_detail_ids.discard(mid)
+                    elif detail_status == "not_found":
+                        # Real deleted/private MAL entry: list data is the best
+                        # authoritative data available.
+                        full_anime.append(a)
+                        pending_detail_ids.discard(mid)
+                    else:
+                        unresolved_this_season.append(mid)
+                        pending_detail_ids.add(mid)
+
+                    # Save progress inside large seasons so runner termination
+                    # loses at most a small batch of detail requests.
+                    if n % 10 == 0:
+                        detail_cache["pending"] = sorted(pending_detail_ids)
+                        save_json_cache(MAL_DETAIL_CACHE_FILE, detail_cache)
+
+                detail_cache["pending"] = sorted(pending_detail_ids)
+                save_json_cache(MAL_DETAIL_CACHE_FILE, detail_cache)
+
+                if unresolved_this_season:
+                    print(
+                        f"\n    MAL detail pending: {len(unresolved_this_season)} "
+                        f"(saved for retry; not written as partial records)",
+                        flush=True,
+                    )
 
                 # AniList bulk ID lookup
                 mal_ids = [a["id"] for a in full_anime if a.get("id")]
@@ -397,7 +548,7 @@ def main():
                     existing_mal_ids.add(mid)
 
                 found_al = sum(1 for a in full_anime if anilist_map.get(a.get("id")))
-                print(f"| AniList: {found_al}/{len(new_anime)} | total: {len(all_entries)}")
+                print(f"| AniList: {found_al}/{len(full_anime)} | pending MAL detail: {len(unresolved_this_season)} | total: {len(all_entries)}")
 
             season_index += 1
             save_checkpoint(season_index, all_entries)
