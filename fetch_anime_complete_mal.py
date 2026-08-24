@@ -53,6 +53,7 @@ CHECKPOINT_FILE  = "checkpoint_anime.json"
 MAL_CACHE_FILE   = "mal_season_cache.json"
 ANILIST_CACHE_FILE = "anilist_lookup_cache.json"
 MAL_DETAIL_CACHE_FILE = "mal_detail_cache.json"
+MAX_LEGACY_DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 ANILIST_BATCH    = 50
 PAGE_LIMIT       = 100     # MAL max limit per page for the anime list endpoint
 
@@ -88,6 +89,46 @@ def save_json_cache(path, value):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(value, f, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def load_compact_detail_cache(completed_mal_ids):
+    """Load only resumable details that are not already in the checkpoint.
+
+    Older versions accumulated every fetched MAL response forever. That file
+    can grow to hundreds of MB and make a resumed Actions run appear frozen
+    immediately after the [Resume] line. Completed entries already contain
+    those details, so an oversized legacy cache is safe to discard; at worst
+    the currently incomplete season is fetched again.
+    """
+    if not os.path.exists(MAL_DETAIL_CACHE_FILE):
+        print("[Resume] No detail cache; continuing from checkpoint.", flush=True)
+        return {"version": 2, "details": {}, "pending": []}
+
+    size = os.path.getsize(MAL_DETAIL_CACHE_FILE)
+    if size > MAX_LEGACY_DETAIL_CACHE_BYTES:
+        print(
+            f"[Resume] Legacy detail cache is {size / 1024 / 1024:.1f} MiB; "
+            "skipping it to avoid the startup stall. The current season will be refetched.",
+            flush=True,
+        )
+        compact = {"version": 2, "details": {}, "pending": []}
+        save_json_cache(MAL_DETAIL_CACHE_FILE, compact)
+        return compact
+
+    print(f"[Resume] Loading detail cache ({size / 1024 / 1024:.1f} MiB) ...", flush=True)
+    cache = load_json_cache(MAL_DETAIL_CACHE_FILE, {"version": 2, "details": {}, "pending": []})
+    old_details = cache.get("details") or {}
+    details = {
+        str(mid): detail
+        for mid, detail in old_details.items()
+        if int(mid) not in completed_mal_ids
+    }
+    pending = [mid for mid in (cache.get("pending") or []) if mid not in completed_mal_ids]
+    compact = {"version": 2, "details": details, "pending": pending}
+    if len(details) != len(old_details) or cache.get("version") != 2:
+        save_json_cache(MAL_DETAIL_CACHE_FILE, compact)
+    print(f"[Resume] Detail cache ready: {len(details)} unfinished records.", flush=True)
+    return compact
 
 
 def mal_get(path, params=None):
@@ -308,7 +349,7 @@ def load_checkpoint():
         try:
             with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
                 ck = json.load(f)
-            print(f"\n[Resume] season_index={ck['season_index']}  entries={len(ck['entries'])}\n")
+            print(f"\n[Resume] season_index={ck['season_index']}  entries={len(ck['entries'])}\n", flush=True)
             return ck["season_index"], ck["entries"]
         except Exception as exc:
             print(f"[Warning] Checkpoint corrupt ({exc}) - starting fresh\n")
@@ -434,6 +475,7 @@ def main():
     # Resume intelligently: completed seasons live in MAL_CACHE_FILE.
     # If the old linear checkpoint advanced past a future 404 season, rewind
     # only to the earliest season not present in the persistent completed cache.
+    print("[Resume] Checking completed season index ...", flush=True)
     _season_cache = load_json_cache(MAL_CACHE_FILE, {"version": 1, "seasons": {}})
     _completed = (_season_cache.get("seasons") or {})
     earliest_missing_index = None
@@ -445,7 +487,7 @@ def main():
     if earliest_missing_index is not None:
         season_index = min(season_index, earliest_missing_index)
     existing_mal_ids = {e["mal_id"] for e in all_entries}
-    detail_cache = load_json_cache(MAL_DETAIL_CACHE_FILE, {"version": 1, "details": {}, "pending": []})
+    detail_cache = load_compact_detail_cache(existing_mal_ids)
     detail_map = detail_cache.setdefault("details", {})
     pending_detail_ids = set(detail_cache.get("pending") or [])
 
@@ -454,6 +496,7 @@ def main():
 
     try:
         while season_index < len(all_seasons):
+            compact_after_checkpoint = []
             year, season = all_seasons[season_index]
             print(f"  [MAL] {year} {season} ...", end=" ", flush=True)
 
@@ -546,12 +589,23 @@ def main():
                     entry = build_entry(anime, anilist_map.get(mid) if mid else None)
                     all_entries.append(entry)
                     existing_mal_ids.add(mid)
+                    compact_after_checkpoint.append(mid)
 
                 found_al = sum(1 for a in full_anime if anilist_map.get(a.get("id")))
                 print(f"| AniList: {found_al}/{len(full_anime)} | pending MAL detail: {len(unresolved_this_season)} | total: {len(all_entries)}")
 
             season_index += 1
             save_checkpoint(season_index, all_entries)
+
+            # Once the full entry is durable in checkpoint_anime.json, its
+            # raw detail response is redundant. Keeping only unfinished work
+            # prevents the cache from growing without bound across years.
+            if compact_after_checkpoint:
+                for mid in compact_after_checkpoint:
+                    detail_map.pop(str(mid), None)
+                    pending_detail_ids.discard(mid)
+                detail_cache["pending"] = sorted(pending_detail_ids)
+                save_json_cache(MAL_DETAIL_CACHE_FILE, detail_cache)
 
     except KeyboardInterrupt:
         print("\n\n[Paused] Saving checkpoint ...")

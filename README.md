@@ -45,5 +45,7 @@ workflow failures/timeouts.
 - Cache is saved every 10 detail records.
 - Transiently failed details stay `pending`; they are not silently written as incomplete records.
 - The next run retries pending IDs.
-- GitHub Actions caches the detail cache and keeps the 10-hour timeout.
+- GitHub Actions caches the detail cache and runs four resumable 4h 50m fetch
+  chunks, providing an approximately 20-hour fetch window without exceeding
+  GitHub-hosted runners' per-job time limit.
 - Redundant competing checkpoint-cache steps and duplicate YAML `if:` keys were fixed.

@@ -13,43 +13,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  fetch:
+  cadence:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
-
+    outputs:
+      run: ${{ steps.check.outputs.run }}
     steps:
       - name: Every 3 days gate
-        id: cadence
+        id: check
         shell: bash
         run: |
           DAY=$(( $(date -u +%s) / 86400 ))
-          if (( DAY % 3 == 0 )); then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || (( DAY % 3 == 0 )); then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "Not a scheduled 3-day build day."
           fi
 
+  fetch-part-1:
+    needs: cadence
+    if: needs.cadence.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
       - name: Checkout repository
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-
       - name: Setup Python
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install dependencies
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
         run: python -m pip install -r requirements.txt
-
-
       - name: Restore resumable fetch cache
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -57,19 +55,20 @@ jobs:
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
-          key: anime-fetch-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: anime-fetch-v3-start-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            anime-fetch-v2-
-
-      - name: Fetch anime data
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
+            anime-fetch-v3-part-4-
+            anime-fetch-v3-part-3-
+            anime-fetch-v3-part-2-
+            anime-fetch-v3-part-1-
+            anime-fetch-v3-start-
+      - name: Fetch anime data (first 4h 50m)
+        continue-on-error: true
         env:
           MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
-        run: python fetch_anime_complete_mal.py
-
-
-      - name: Save resumable fetch cache
-        if: always() && (github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true')
+        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+      - name: Save part 1 checkpoint
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: |
@@ -77,26 +76,157 @@ jobs:
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
-          key: anime-fetch-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: anime-fetch-v3-part-1-${{ github.run_id }}-${{ github.run_attempt }}
 
+  fetch-part-2:
+    needs: [cadence, fetch-part-1]
+    if: needs.cadence.outputs.run == 'true' && always() && needs.fetch-part-1.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore part 1 checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            anime-fetch-v3-part-2-
+            anime-fetch-v3-part-1-
+      - name: Fetch anime data (second 4h 50m)
+        continue-on-error: true
+        env:
+          MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
+        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+      - name: Save part 2 checkpoint
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-2-${{ github.run_id }}-${{ github.run_attempt }}
+
+  fetch-part-3:
+    needs: [cadence, fetch-part-2]
+    if: needs.cadence.outputs.run == 'true' && always() && needs.fetch-part-2.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore part 2 checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            anime-fetch-v3-part-4-
+            anime-fetch-v3-part-3-
+            anime-fetch-v3-part-2-
+      - name: Fetch anime data (third 4h 50m)
+        continue-on-error: true
+        env:
+          MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
+        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+      - name: Save part 3 checkpoint
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-3-${{ github.run_id }}-${{ github.run_attempt }}
+
+  fetch-part-4:
+    needs: [cadence, fetch-part-3]
+    if: needs.cadence.outputs.run == 'true' && always() && needs.fetch-part-3.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore part 3 checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            anime-fetch-v3-part-4-
+            anime-fetch-v3-part-3-
+      - name: Fetch anime data (fourth 4h 50m)
+        continue-on-error: true
+        env:
+          MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
+        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+      - name: Save final resumable fetch cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            checkpoint_anime.json
+            mal_season_cache.json
+            anilist_lookup_cache.json
+            mal_detail_cache.json
+          key: anime-fetch-v3-part-4-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Commit generated JSON
-        if: github.event_name == 'workflow_dispatch' || steps.cadence.outputs.run == 'true'
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           if [ -f anime_all_complete.json ]; then
             git add anime_all_complete.json
           fi
-
           if [ -f checkpoint_anime.json ]; then
             git add checkpoint_anime.json
           fi
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-
           git commit -m "chore: update anime database"
           git push
