@@ -73,6 +73,7 @@ jobs:
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -96,10 +97,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Restore part 1 checkpoint
+        id: restore-part-1
         uses: actions/cache/restore@v4
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -111,13 +114,22 @@ jobs:
         continue-on-error: true
         env:
           MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
-        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+        shell: bash
+        run: |
+          if [[ "${{ steps.restore-part-1.outputs.cache-hit }}" == "true" && \
+                ! -f checkpoint_anime.json && \
+                -f anime_all_complete.json ]]; then
+            echo "Part 1 already completed the full database; skipping duplicate fetch."
+          else
+            timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+          fi
       - name: Save part 2 checkpoint
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -141,10 +153,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Restore part 2 checkpoint
+        id: restore-part-2
         uses: actions/cache/restore@v4
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -157,13 +171,22 @@ jobs:
         continue-on-error: true
         env:
           MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
-        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+        shell: bash
+        run: |
+          if [[ "${{ steps.restore-part-2.outputs.cache-hit }}" == "true" && \
+                ! -f checkpoint_anime.json && \
+                -f anime_all_complete.json ]]; then
+            echo "Part 2 already completed the full database; skipping duplicate fetch."
+          else
+            timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+          fi
       - name: Save part 3 checkpoint
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -187,10 +210,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Restore part 3 checkpoint
+        id: restore-part-3
         uses: actions/cache/restore@v4
         with:
           path: |
             checkpoint_anime.json
+            anime_all_complete.json
             mal_season_cache.json
             anilist_lookup_cache.json
             mal_detail_cache.json
@@ -202,7 +227,15 @@ jobs:
         continue-on-error: true
         env:
           MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
-        run: timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+        shell: bash
+        run: |
+          if [[ "${{ steps.restore-part-3.outputs.cache-hit }}" == "true" && \
+                ! -f checkpoint_anime.json && \
+                -f anime_all_complete.json ]]; then
+            echo "Part 3 already completed the full database; skipping duplicate fetch."
+          else
+            timeout --signal=TERM --kill-after=30s 290m python -u fetch_anime_complete_mal.py
+          fi
       - name: Save final resumable fetch cache
         if: always()
         uses: actions/cache/save@v4
