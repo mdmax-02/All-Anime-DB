@@ -4,7 +4,7 @@ Anime Complete Fetcher  (MAL Official API version, with relations)
 ====================================================================
 Primary source : MAL Official API v2  (https://myanimelist.net/apiconfig)
 AniList lookup : MAL ID -> AniList ID only
-Relations      : related_anime field -> parent series (prequel/parent_story/etc.)
+Relations      : full related_anime graph (all MAL relation edges preserved)
 
 COVERAGE STRATEGY
 ------------------
@@ -49,6 +49,7 @@ CLIENT_ID        = os.environ.get("MAL_CLIENT_ID", "")
 MAL_INTERVAL     = 1.35     # be polite - MAL doesn't publish an official number
 ANILIST_INTERVAL = 0.72
 OUTPUT_FILE      = "anime_all_complete.json"
+DATA_SCHEMA_VERSION = 4
 CHECKPOINT_FILE  = "checkpoint_anime.json"
 MAL_CACHE_FILE   = "mal_season_cache.json"
 ANILIST_CACHE_FILE = "anilist_lookup_cache.json"
@@ -240,9 +241,14 @@ FORMAT_CATEGORY = {
 }
 CATEGORY_ORDER = ["TV", "SPECIAL", "OVA", "MOVIE", "ONA", "MUSIC", "UNKNOWN"]
 
-# MAL relation_type values that indicate a parent series
-# (see https://myanimelist.net/apiconfig/references/api/v2 - related_anime)
+# MAL relation types used to build a franchise graph.
+# We preserve *all* related_anime edges in each entry, but exclude weak/crossover
+# links from recursive franchise traversal to avoid merging unrelated franchises.
 PARENT_RELATIONS = {"prequel", "parent_story", "alternative_setting", "alternative_version"}
+FRANCHISE_RELATIONS = {
+    "sequel", "prequel", "alternative_setting", "alternative_version",
+    "side_story", "parent_story", "summary", "full_story", "spin_off",
+}
 
 
 def parse_date(d):
@@ -290,13 +296,32 @@ def build_entry(anime, anilist_id):
 
     stats = (anime.get("statistics") or {}).get("num_list_users")
 
-    # related_anime -> parent_mal_ids
+    # Preserve the COMPLETE MAL related_anime payload instead of throwing away
+    # sequel/side_story/summary/spin_off edges. parent_mal_ids is retained for
+    # backward compatibility with existing consumers.
+    relations = []
+    relation_mal_ids = []
     parent_mal_ids = []
+    seen_rel_ids = set()
     for rel in (anime.get("related_anime") or []):
-        if rel.get("relation_type") in PARENT_RELATIONS:
-            node = rel.get("node") or {}
-            if node.get("id"):
-                parent_mal_ids.append(node["id"])
+        node = rel.get("node") or {}
+        rel_id = node.get("id")
+        if not rel_id:
+            continue
+
+        rel_type = rel.get("relation_type")
+        relations.append({
+            "mal_id": rel_id,
+            "relation_type": rel_type,
+            "relation_type_formatted": rel.get("relation_type_formatted"),
+        })
+
+        if rel_id not in seen_rel_ids:
+            seen_rel_ids.add(rel_id)
+            relation_mal_ids.append(rel_id)
+
+        if rel_type in PARENT_RELATIONS and rel_id not in parent_mal_ids:
+            parent_mal_ids.append(rel_id)
 
     return {
         "mal_id":         mal_id,
@@ -327,6 +352,8 @@ def build_entry(anime, anilist_id):
         "synopsis":       anime.get("synopsis"),
         "cover_image":    cover,
         "trailer_url":    None,  # not exposed by MAL official API
+        "relations":       relations,
+        "relation_mal_ids": relation_mal_ids,
         "parent_mal_ids": parent_mal_ids,
     }
 
@@ -349,6 +376,13 @@ def load_checkpoint():
         try:
             with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
                 ck = json.load(f)
+            if ck.get("schema_version") != DATA_SCHEMA_VERSION:
+                print(
+                    f"[Resume] Old checkpoint schema {ck.get('schema_version')} detected; "
+                    f"relation schema v{DATA_SCHEMA_VERSION} requires a clean rebuild.",
+                    flush=True,
+                )
+                return 0, []
             print(f"\n[Resume] season_index={ck['season_index']}  entries={len(ck['entries'])}\n", flush=True)
             return ck["season_index"], ck["entries"]
         except Exception as exc:
@@ -359,20 +393,100 @@ def load_checkpoint():
 def save_checkpoint(season_index, entries):
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"season_index": season_index, "fetched": len(entries), "entries": entries},
-                   f, ensure_ascii=False)
+        json.dump({
+            "schema_version": DATA_SCHEMA_VERSION,
+            "season_index": season_index,
+            "fetched": len(entries),
+            "entries": entries,
+        }, f, ensure_ascii=False)
     os.replace(tmp, CHECKPOINT_FILE)
 
 
+def _build_complete_relation_graph(entries):
+    """Make MAL relations bidirectional and build recursive franchise components.
+
+    MAL detail responses are directional. If A says B is a sequel but B omits
+    the reverse edge (or the old parent-only logic would have discarded it),
+    we still connect A<->B. Recursive traversal uses only strong franchise
+    relation types; raw `relations` continues to preserve every MAL edge.
+    """
+    by_id = {e["mal_id"]: e for e in entries if e.get("mal_id")}
+    graph = defaultdict(set)
+
+    for entry in entries:
+        src = entry.get("mal_id")
+        if not src:
+            continue
+        for rel in entry.get("relations") or []:
+            dst = rel.get("mal_id")
+            rel_type = rel.get("relation_type")
+            if dst and rel_type in FRANCHISE_RELATIONS:
+                graph[src].add(dst)
+                graph[dst].add(src)
+
+    # Ensure direct relation ids expose reverse links too. This is intentionally
+    # separate from raw `relations`, which remains the exact MAL response.
+    for mid, entry in by_id.items():
+        direct = set(entry.get("relation_mal_ids") or [])
+        for neighbor in graph.get(mid, ()):
+            direct.add(neighbor)
+        entry["relation_mal_ids"] = sorted(direct)
+
+    visited = set()
+    for start_id in by_id:
+        if start_id in visited:
+            continue
+
+        stack = [start_id]
+        component = set()
+        while stack:
+            cur = stack.pop()
+            if cur in component:
+                continue
+            component.add(cur)
+            for nxt in graph.get(cur, ()):
+                if nxt in by_id and nxt not in component:
+                    stack.append(nxt)
+
+        visited.update(component)
+        component_sorted = sorted(component)
+
+        # Precompute the four relation buckets ClixArena needs most often.
+        buckets = {"MOVIE": [], "OVA": [], "ONA": [], "SPECIAL": []}
+        for related_id in component_sorted:
+            related = by_id.get(related_id)
+            if not related:
+                continue
+            cat = related.get("category")
+            if cat in buckets:
+                buckets[cat].append(related_id)
+
+        for mid in component:
+            entry = by_id[mid]
+            entry["franchise_mal_ids"] = [x for x in component_sorted if x != mid]
+            entry["related_movies"] = [x for x in buckets["MOVIE"] if x != mid]
+            entry["related_ovas"] = [x for x in buckets["OVA"] if x != mid]
+            entry["related_onas"] = [x for x in buckets["ONA"] if x != mid]
+            entry["related_specials"] = [x for x in buckets["SPECIAL"] if x != mid]
+
+
 def save_output(entries):
-    print("\nBuilding final JSON ...")
-    cats = defaultdict(list)
+    print("\nBuilding complete bidirectional relation graph ...")
+
+    # Deduplicate first so relation graph and category output use the same rows.
+    unique_entries = []
     seen = set()
     for e in entries:
         mid = e["mal_id"]
         if mid not in seen:
             seen.add(mid)
-            cats[e["category"]].append(e)
+            unique_entries.append(e)
+
+    _build_complete_relation_graph(unique_entries)
+
+    cats = defaultdict(list)
+    for e in unique_entries:
+        cats[e["category"]].append(e)
 
     for cat in cats:
         cats[cat].sort(key=lambda e: (
@@ -381,14 +495,17 @@ def save_output(entries):
             (e["start_date"] or {}).get("day")   or 99,
         ))
 
-    has_anilist = sum(1 for e in entries if e.get("anilist_id"))
+    has_anilist = sum(1 for e in unique_entries if e.get("anilist_id"))
+    with_relations = sum(1 for e in unique_entries if e.get("relation_mal_ids"))
     output = {
         "meta": {
-            "fetched_at":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "total_fetched":   len(seen),
-            "with_anilist_id": has_anilist,
-            "source":          "MAL Official API v2 + AniList ID lookup + related_anime",
-            "categories":      {cat: len(cats[cat]) for cat in CATEGORY_ORDER if cat in cats},
+            "schema_version":    DATA_SCHEMA_VERSION,
+            "fetched_at":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_fetched":     len(seen),
+            "with_anilist_id":   has_anilist,
+            "with_relations":    with_relations,
+            "source":            "MAL Official API v2 + AniList ID lookup + complete related_anime graph",
+            "categories":        {cat: len(cats[cat]) for cat in CATEGORY_ORDER if cat in cats},
         },
         "by_category": {cat: cats[cat] for cat in CATEGORY_ORDER if cat in cats},
     }
@@ -397,8 +514,9 @@ def save_output(entries):
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"\n=> Saved : {OUTPUT_FILE}")
-    print(f"   Total      : {len(seen)}")
-    print(f"   AniList IDs: {has_anilist}")
+    print(f"   Total         : {len(seen)}")
+    print(f"   AniList IDs   : {has_anilist}")
+    print(f"   With relations: {with_relations}")
     for cat in CATEGORY_ORDER:
         if cat in cats:
             print(f"   {cat:10s}: {len(cats[cat])}")

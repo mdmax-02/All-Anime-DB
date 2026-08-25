@@ -49,3 +49,21 @@ workflow failures/timeouts.
   chunks, providing an approximately 20-hour fetch window without exceeding
   GitHub-hosted runners' per-job time limit.
 - Redundant competing checkpoint-cache steps and duplicate YAML `if:` keys were fixed.
+
+
+## v4 complete MAL relation graph
+
+The fetcher now preserves every edge returned by MAL Official API v2 `related_anime` instead of keeping only parent-like relations. Each anime entry includes:
+
+- `relations`: the raw MAL relation edges with MAL ID and relation type.
+- `relation_mal_ids`: direct relation IDs, normalized bidirectionally for strong franchise links.
+- `parent_mal_ids`: retained for backward compatibility.
+- `franchise_mal_ids`: recursively connected franchise entries.
+- `related_movies`: all connected `MOVIE` MAL IDs.
+- `related_ovas`: all connected `OVA` MAL IDs.
+- `related_onas`: all connected `ONA` MAL IDs.
+- `related_specials`: all connected `SPECIAL` MAL IDs.
+
+Recursive traversal uses sequel, prequel, side-story, parent-story, summary, full-story, spin-off, alternative-setting, and alternative-version edges. Weak crossover-style links are still preserved in `relations`, but are not allowed to merge whole franchises.
+
+Because v3 checkpoints discarded relation edges, v4 uses a new checkpoint/cache schema and intentionally performs a clean MAL detail rebuild on the first v4 run.
