@@ -40,13 +40,13 @@ only required for endpoints that modify a user's list.
 Output: anime_all_complete.json
 """
 
-import json, time, os, sys, requests, random
+import json, time, os, sys, requests, random, hashlib
 from collections import defaultdict
 
 MAL_API          = "https://api.myanimelist.net/v2"
 ANILIST_API      = "https://graphql.anilist.co"
 CLIENT_ID        = os.environ.get("MAL_CLIENT_ID", "")
-MAL_INTERVAL     = 1.35     # be polite - MAL doesn't publish an official number
+MAL_INTERVAL     = 0.45     # fast catalog scan; 429 handling remains authoritative
 ANILIST_INTERVAL = 0.72
 OUTPUT_FILE      = "anime_all_complete.json"
 DATA_SCHEMA_VERSION = 4
@@ -57,6 +57,8 @@ MAL_DETAIL_CACHE_FILE = "mal_detail_cache.json"
 MAX_LEGACY_DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 ANILIST_BATCH    = 50
 PAGE_LIMIT       = 100     # MAL max limit per page for the anime list endpoint
+_baseline_meta = {}
+_checked_mal_ids = set()
 
 # Fields requested for the /anime/ranking (list) call - keep this light,
 # we fetch full detail (incl. related_anime) per-anime separately.
@@ -358,6 +360,23 @@ def build_entry(anime, anilist_id):
     }
 
 
+SOURCE_RECORD_FIELDS = (
+    "mal_id", "anilist_id", "title_romaji", "title_english", "title_native",
+    "format", "category", "status", "episodes", "duration", "start_date",
+    "end_date", "air_date", "season", "season_year", "score", "scored_by",
+    "rank", "popularity", "members", "favorites", "genres", "studios",
+    "source", "rating", "synopsis", "cover_image", "trailer_url", "relations",
+    "relation_mal_ids", "parent_mal_ids",
+)
+
+
+def source_record_hash(entry):
+    """Stable SHA-256 for fields fetched from MAL/AniList, excluding derived graph fields."""
+    payload = {key: entry.get(key) for key in SOURCE_RECORD_FIELDS}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 SEASONS = ["winter", "spring", "summer", "fall"]
 START_YEAR = 1917   # earliest anime on MAL
 import datetime
@@ -371,7 +390,28 @@ def season_sequence():
             yield year, season
 
 
+def load_output_entries():
+    """Use the committed database as the baseline for an update run."""
+    global _baseline_meta
+    if not os.path.exists(OUTPUT_FILE):
+        return []
+    try:
+        output = load_json_cache(OUTPUT_FILE, {})
+        _baseline_meta = output.get("meta") or {}
+        if _baseline_meta.get("schema_version") != DATA_SCHEMA_VERSION:
+            return []
+        entries = []
+        for category in CATEGORY_ORDER:
+            entries.extend((output.get("by_category") or {}).get(category) or [])
+        print(f"[Incremental] Loaded {len(entries)} existing records from {OUTPUT_FILE}.", flush=True)
+        return entries
+    except Exception as exc:
+        print(f"[Warning] Could not load existing output ({exc}); a full build is required.", flush=True)
+        return []
+
+
 def load_checkpoint():
+    global _checked_mal_ids
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
@@ -382,20 +422,33 @@ def load_checkpoint():
                     f"relation schema v{DATA_SCHEMA_VERSION} requires a clean rebuild.",
                     flush=True,
                 )
-                return 0, []
+                return 0, [], None, "full"
             print(f"\n[Resume] season_index={ck['season_index']}  entries={len(ck['entries'])}\n", flush=True)
-            return ck["season_index"], ck["entries"]
+            plan = ck.get("season_plan")
+            if plan:
+                plan = [(int(item[0]), str(item[1])) for item in plan]
+            _checked_mal_ids = {int(mid) for mid in (ck.get("checked_mal_ids") or [])}
+            return ck["season_index"], ck["entries"], plan, ck.get("mode", "full")
         except Exception as exc:
             print(f"[Warning] Checkpoint corrupt ({exc}) - starting fresh\n")
-    return 0, []
+    existing = load_output_entries()
+    if existing:
+        # Scan every lightweight seasonal listing so an anime newly added to
+        # ANY historical MAL season is discovered immediately. Every existing
+        # record is also detail-checked and hash-compared during the scan.
+        return 0, existing, list(season_sequence()), "incremental"
+    return 0, [], None, "full"
 
 
-def save_checkpoint(season_index, entries):
+def save_checkpoint(season_index, entries, season_plan, mode):
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({
             "schema_version": DATA_SCHEMA_VERSION,
             "season_index": season_index,
+            "season_plan": season_plan,
+            "mode": mode,
+            "checked_mal_ids": sorted(_checked_mal_ids),
             "fetched": len(entries),
             "entries": entries,
         }, f, ensure_ascii=False)
@@ -497,6 +550,13 @@ def save_output(entries):
 
     has_anilist = sum(1 for e in unique_entries if e.get("anilist_id"))
     with_relations = sum(1 for e in unique_entries if e.get("relation_mal_ids"))
+    content_hasher = hashlib.sha256()
+    for entry in sorted(unique_entries, key=lambda item: item.get("mal_id") or 0):
+        content_hasher.update(json.dumps(
+            entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8"))
+        content_hasher.update(b"\n")
+    content_hash = content_hasher.hexdigest()
     output = {
         "meta": {
             "schema_version":    DATA_SCHEMA_VERSION,
@@ -504,6 +564,7 @@ def save_output(entries):
             "total_fetched":     len(seen),
             "with_anilist_id":   has_anilist,
             "with_relations":    with_relations,
+            "content_sha256":    content_hash,
             "source":            "MAL Official API v2 + AniList ID lookup + complete related_anime graph",
             "categories":        {cat: len(cats[cat]) for cat in CATEGORY_ORDER if cat in cats},
         },
@@ -522,7 +583,7 @@ def save_output(entries):
             print(f"   {cat:10s}: {len(cats[cat])}")
 
 
-def fetch_season_all_pages(year, season):
+def fetch_season_all_pages(year, season, force_refresh=False):
     """
     Fetch a season with persistent per-season caching.
 
@@ -539,7 +600,7 @@ def fetch_season_all_pages(year, season):
     key = f"{year}-{season}"
 
     cached = seasons.get(key)
-    if isinstance(cached, dict) and cached.get("status") == "complete":
+    if not force_refresh and isinstance(cached, dict) and cached.get("status") == "complete":
         return "ok", cached.get("nodes", [])
 
     nodes = []
@@ -587,25 +648,53 @@ def main():
         print('   export MAL_CLIENT_ID="your_client_id_here"')
         sys.exit(1)
 
-    all_seasons = list(season_sequence())
-    season_index, all_entries = load_checkpoint()
+    full_seasons = list(season_sequence())
+    season_index, all_entries, saved_plan, run_mode = load_checkpoint()
+    all_seasons = saved_plan or full_seasons
+    print(f"[Mode] {run_mode}; seasons in this run: {len(all_seasons)}", flush=True)
 
     # Resume intelligently: completed seasons live in MAL_CACHE_FILE.
     # If the old linear checkpoint advanced past a future 404 season, rewind
     # only to the earliest season not present in the persistent completed cache.
     print("[Resume] Checking completed season index ...", flush=True)
-    _season_cache = load_json_cache(MAL_CACHE_FILE, {"version": 1, "seasons": {}})
-    _completed = (_season_cache.get("seasons") or {})
-    earliest_missing_index = None
-    for idx, (yy, ss) in enumerate(all_seasons):
-        item = _completed.get(f"{yy}-{ss}")
-        if not (isinstance(item, dict) and item.get("status") == "complete"):
-            earliest_missing_index = idx
-            break
-    if earliest_missing_index is not None:
-        season_index = min(season_index, earliest_missing_index)
+    if run_mode == "full":
+        _season_cache = load_json_cache(MAL_CACHE_FILE, {"version": 1, "seasons": {}})
+        _completed = (_season_cache.get("seasons") or {})
+        earliest_missing_index = None
+        for idx, (yy, ss) in enumerate(all_seasons):
+            item = _completed.get(f"{yy}-{ss}")
+            if not (isinstance(item, dict) and item.get("status") == "complete"):
+                earliest_missing_index = idx
+                break
+        if earliest_missing_index is not None:
+            season_index = min(season_index, earliest_missing_index)
     existing_mal_ids = {e["mal_id"] for e in all_entries}
-    detail_cache = load_compact_detail_cache(existing_mal_ids)
+    entry_index_by_mal = {e["mal_id"]: i for i, e in enumerate(all_entries) if e.get("mal_id")}
+    existing_anilist_by_mal = {
+        e["mal_id"]: e.get("anilist_id")
+        for e in all_entries
+        if e.get("mal_id") and e.get("anilist_id")
+    }
+    # Assign every old record to one plan slot. Records with MAL start-season
+    # metadata use their exact season; undated/irregular records are spread
+    # deterministically across the plan. Injecting these IDs into that slot
+    # guarantees a true full detail check even if MAL no longer returns an old
+    # title from its seasonal listing.
+    plan_index = {pair: idx for idx, pair in enumerate(all_seasons)}
+    old_ids_by_plan_index = defaultdict(list)
+    if run_mode == "incremental" and all_seasons:
+        for entry in all_entries:
+            mid = entry.get("mal_id")
+            if not mid:
+                continue
+            pair = (entry.get("season_year"), entry.get("season"))
+            idx = plan_index.get(pair)
+            if idx is None:
+                idx = mid % len(all_seasons)
+            old_ids_by_plan_index[idx].append(mid)
+    detail_cache = load_compact_detail_cache(
+        _checked_mal_ids if run_mode == "incremental" else existing_mal_ids
+    )
     detail_map = detail_cache.setdefault("details", {})
     pending_detail_ids = set(detail_cache.get("pending") or [])
 
@@ -618,7 +707,17 @@ def main():
             year, season = all_seasons[season_index]
             print(f"  [MAL] {year} {season} ...", end=" ", flush=True)
 
-            season_status, anime_list = fetch_season_all_pages(year, season)
+            season_status, anime_list = fetch_season_all_pages(
+                year, season, force_refresh=(run_mode == "incremental")
+            )
+
+            if season_status == "ok" and run_mode == "incremental":
+                listed_ids = {item.get("id") for item in anime_list}
+                anime_list.extend(
+                    {"id": mid}
+                    for mid in old_ids_by_plan_index.get(season_index, [])
+                    if mid not in listed_ids
+                )
 
             if season_status == "unavailable":
                 # Future/unpublished season. Do not mark it completed in the
@@ -627,14 +726,14 @@ def main():
                 print("not available yet - skipping for this run")
                 season_retry_count = 0
                 season_index += 1
-                save_checkpoint(season_index, all_entries)
+                save_checkpoint(season_index, all_entries, all_seasons, run_mode)
                 continue
 
             if season_status == "failed":
                 season_retry_count += 1
                 if season_retry_count >= MAX_SEASON_RETRIES:
                     print(f"failed {MAX_SEASON_RETRIES}x - stopping safely")
-                    save_checkpoint(season_index, all_entries)
+                    save_checkpoint(season_index, all_entries, all_seasons, run_mode)
                     return
                 print(f"failed ({season_retry_count}/{MAX_SEASON_RETRIES}) - retrying in 10s ...")
                 time.sleep(10)
@@ -645,16 +744,30 @@ def main():
             if not anime_list:
                 print("no entries")
             else:
-                new_anime = [a for a in anime_list
-                             if a.get("id") not in existing_mal_ids]
-                print(f"{len(anime_list)} found, {len(new_anime)} new  ", end="", flush=True)
+                # Full update mode checks every record returned by every MAL
+                # season, but merges it into the existing JSON by MAL ID.
+                # Processing one season at a time keeps each checkpoint small
+                # and lets Part 2/3/4 resume at the next season.
+                anime_to_fetch = anime_list if run_mode == "incremental" else [
+                    a for a in anime_list if a.get("id") not in existing_mal_ids
+                ]
+                if run_mode == "incremental":
+                    anime_to_fetch = [
+                        item for item in anime_to_fetch
+                        if item.get("id") not in _checked_mal_ids
+                    ]
+                new_count = sum(1 for a in anime_to_fetch if a.get("id") not in existing_mal_ids)
+                print(
+                    f"{len(anime_list)} found, {new_count} new, "
+                    f"{len(anime_to_fetch) - new_count} refresh  ", end="", flush=True
+                )
 
                 # Fetch full detail with persistent per-MAL cache. A transient
                 # network failure is kept pending instead of being permanently
                 # written as a partial record.
                 full_anime = []
                 unresolved_this_season = []
-                for n, a in enumerate(new_anime, 1):
+                for n, a in enumerate(anime_to_fetch, 1):
                     mid = a.get("id")
                     if not mid:
                         continue
@@ -671,9 +784,13 @@ def main():
                         full_anime.append(detail)
                         pending_detail_ids.discard(mid)
                     elif detail_status == "not_found":
-                        # Real deleted/private MAL entry: list data is the best
-                        # authoritative data available.
-                        full_anime.append(a)
+                        # Keep an existing rich record when MAL temporarily
+                        # hides/deletes its detail endpoint; do not replace it
+                        # with the lightweight seasonal-list node.
+                        if mid in existing_mal_ids:
+                            _checked_mal_ids.add(mid)
+                        else:
+                            full_anime.append(a)
                         pending_detail_ids.discard(mid)
                     else:
                         unresolved_this_season.append(mid)
@@ -697,23 +814,56 @@ def main():
 
                 # AniList bulk ID lookup
                 mal_ids = [a["id"] for a in full_anime if a.get("id")]
-                anilist_map = {}
-                if mal_ids:
-                    for i in range(0, len(mal_ids), ANILIST_BATCH):
-                        anilist_map.update(anilist_lookup(mal_ids[i:i + ANILIST_BATCH]))
+                # Existing MAL->AniList ids are stable. Reuse them and query
+                # AniList only for genuinely new/unmapped MAL records.
+                anilist_map = {
+                    mid: existing_anilist_by_mal[mid]
+                    for mid in mal_ids
+                    if mid in existing_anilist_by_mal
+                }
+                lookup_ids = [mid for mid in mal_ids if mid not in anilist_map]
+                for i in range(0, len(lookup_ids), ANILIST_BATCH):
+                    anilist_map.update(anilist_lookup(lookup_ids[i:i + ANILIST_BATCH]))
 
+                changed_count = 0
+                unchanged_count = 0
                 for anime in full_anime:
                     mid = anime.get("id")
                     entry = build_entry(anime, anilist_map.get(mid) if mid else None)
-                    all_entries.append(entry)
+                    if mid in entry_index_by_mal:
+                        old_entry = all_entries[entry_index_by_mal[mid]]
+                        if source_record_hash(old_entry) != source_record_hash(entry):
+                            all_entries[entry_index_by_mal[mid]] = entry
+                            changed_count += 1
+                        else:
+                            unchanged_count += 1
+                    else:
+                        entry_index_by_mal[mid] = len(all_entries)
+                        all_entries.append(entry)
+                        changed_count += 1
                     existing_mal_ids.add(mid)
+                    _checked_mal_ids.add(mid)
+                    if entry.get("anilist_id"):
+                        existing_anilist_by_mal[mid] = entry["anilist_id"]
                     compact_after_checkpoint.append(mid)
 
                 found_al = sum(1 for a in full_anime if anilist_map.get(a.get("id")))
-                print(f"| AniList: {found_al}/{len(full_anime)} | pending MAL detail: {len(unresolved_this_season)} | total: {len(all_entries)}")
+                print(
+                    f"| AniList: {found_al}/{len(full_anime)} | changed/new: {changed_count} "
+                    f"| unchanged: {unchanged_count} | pending MAL detail: {len(unresolved_this_season)} "
+                    f"| total: {len(all_entries)}"
+                )
+
+                if unresolved_this_season:
+                    # Do not advance past records that were not checked. Raw
+                    # successful details from this season are cached, so the
+                    # next part retries only the pending requests.
+                    save_checkpoint(season_index, all_entries, all_seasons, run_mode)
+                    print("[Paused] Pending MAL details remain; next part will resume this season.", flush=True)
+                    return
 
             season_index += 1
-            save_checkpoint(season_index, all_entries)
+            save_checkpoint(season_index, all_entries, all_seasons, run_mode)
 
             # Once the full entry is durable in checkpoint_anime.json, its
             # raw detail response is redundant. Keeping only unfinished work
@@ -727,7 +877,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n\n[Paused] Saving checkpoint ...")
-        save_checkpoint(season_index, all_entries)
+        save_checkpoint(season_index, all_entries, all_seasons, run_mode)
         print("[OK] Run again to resume.")
         sys.exit(0)
 

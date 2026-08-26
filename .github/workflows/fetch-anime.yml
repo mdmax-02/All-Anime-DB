@@ -248,18 +248,44 @@ jobs:
           key: anime-fetch-v4-part-4-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Commit generated JSON
         if: always()
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f anime_all_complete.json ]; then
-            git add anime_all_complete.json
-          fi
-          if [ -f checkpoint_anime.json ]; then
-            git add checkpoint_anime.json
-          fi
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
+          if [ ! -f anime_all_complete.json ]; then
+            echo "No completed database output to publish."
             exit 0
           fi
-          git commit -m "chore: update anime database"
-          git push
+
+          SOURCE_JSON="$PWD/anime_all_complete.json"
+
+          # A long fetch can finish after new commits have reached main. Build
+          # the publishing commit on the latest origin/main in a clean
+          # worktree, so the generated JSON never causes a non-fast-forward
+          # push merely because the checkout is old. Retry the tiny
+          # fetch/copy/commit/push window if main moves again concurrently.
+          for ATTEMPT in 1 2 3; do
+            git fetch origin main
+            PUBLISH_DIR="$RUNNER_TEMP/anime-publish-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ATTEMPT}"
+            git worktree add --detach "$PUBLISH_DIR" origin/main
+            cp "$SOURCE_JSON" "$PUBLISH_DIR/anime_all_complete.json"
+
+            if (
+              cd "$PUBLISH_DIR"
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add anime_all_complete.json
+              if git diff --cached --quiet; then
+                echo "No database changes to commit."
+                exit 0
+              fi
+              git commit -m "chore: update anime database"
+              git push origin HEAD:main
+            ); then
+              echo "Database published from latest origin/main."
+              exit 0
+            fi
+
+            echo "main moved during publish attempt ${ATTEMPT}; retrying on the new tip."
+          done
+
+          echo "Failed to publish after 3 fresh latest-main attempts."
+          exit 1
